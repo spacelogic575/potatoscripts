@@ -29,6 +29,7 @@ class Send_EventRaw(RMQMessageSender):
 
     def send_persistent_data(self, data, endtimestamp):
         """Send single record to RMQ."""
+        # Convert integer or string timestamp to datetime
         if isinstance(endtimestamp, (int, float)):
             local_dt = datetime.fromtimestamp(endtimestamp)
             utc_dt = datetime.fromtimestamp(endtimestamp, tz=timezone.utc)
@@ -37,6 +38,7 @@ class Send_EventRaw(RMQMessageSender):
                 local_dt = datetime.strptime(endtimestamp, "%Y-%m-%d %H:%M:%S")
                 utc_dt = local_dt.replace(tzinfo=timezone.utc)
             except ValueError:
+                # If stored as UNIX timestamp string
                 local_dt = datetime.fromtimestamp(float(endtimestamp))
                 utc_dt = datetime.fromtimestamp(float(endtimestamp), tz=timezone.utc)
 
@@ -89,11 +91,11 @@ class Send_EventRaw(RMQMessageSender):
         conn = sqlite3.connect(self.db_raw_path)
         cursor = conn.cursor()
 
-        # Add 12 hours to search query to find the "wrong" future data in the DB
-        search_start = str(int(start) + OFFSET_SECONDS)
-        search_end = str(int(end) + OFFSET_SECONDS)
+        # Subtract 12 hours from the search query to find the delayed data in the DB
+        search_start = str(int(start) - OFFSET_SECONDS)
+        search_end = str(int(end) - OFFSET_SECONDS)
 
-        print(f"[INFO] Seeking records in DB between {search_start} and {search_end} (Adjusted +12h to catch faulty data)...")
+        print(f"[INFO] Seeking records in DB between {search_start} and {search_end} (Adjusted -12h to catch delayed data)...")
 
         cursor.execute('''
             SELECT RegionID, MetricID, PeopleTypeID, PeopleID, EventStartTimeStamp, EventEndTimeStamp, CombineObjectTypeID
@@ -106,12 +108,12 @@ class Send_EventRaw(RMQMessageSender):
         global totalfoundrows
         totalfoundrows = len(rows)
         
-        print(f"[INFO] Found {len(rows)} records. Applying -12h correction to RabbitMQ payload...")
+        print(f"[INFO] Found {len(rows)} records. Applying +12h correction to RabbitMQ payload...")
 
         for row in rows:
-            # Correct the timestamps back to reality (-12 hours) before sending
-            corrected_start = int(float(row[4])) - OFFSET_SECONDS
-            corrected_end = int(float(row[5])) - OFFSET_SECONDS
+            # Correct the timestamps by adding 12 hours before sending
+            corrected_start = int(float(row[4])) + OFFSET_SECONDS
+            corrected_end = int(float(row[5])) + OFFSET_SECONDS
 
             data = {
                 'RoiId': row[0],
@@ -124,10 +126,11 @@ class Send_EventRaw(RMQMessageSender):
             }
             print(f"[DEBUG] Sending data: {data}")
             self.send_persistent_data(data, corrected_end) 
-            time.sleep(0.01)
+            time.sleep(0.01)  # optional delay between messages
 
         conn.close()
         print("[INFO] Database connection closed.")
+
 
     def get_device_data(self):
         self.db_raw_path = "/home/pi/Raspicam/raspicam"
