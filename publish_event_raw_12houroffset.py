@@ -11,10 +11,10 @@ totalfoundrows = 0
 deviceinformation = ""
 fulldeviceinformation = ""
 
-# --- CONFIGURATION ---
-# Use +12 to push data forward 12 hours. Use -12 to push it backwards.
-HOURS_OFFSET = 12 
-# ---------------------
+# --- THE FIX ---
+# The 12-hour shift destroys the curve. Set to 0 to push absolute pure DB time.
+HOURS_OFFSET = 0 
+# ---------------
 
 class Send_EventRaw(RMQMessageSender):
     """Send data via backhaul rewrite module."""
@@ -30,13 +30,13 @@ class Send_EventRaw(RMQMessageSender):
     def send_persistent_data(self, data, original_epoch):
         """Send single record to RMQ with absolute timezone bypass."""
         
-        # 1. Convert the original epoch to an absolute UTC datetime object (ignoring Pi OS timezone)
+        # 1. Convert the original epoch to an absolute UTC datetime object
         utc_dt = datetime.fromtimestamp(float(original_epoch), tz=timezone.utc)
         
-        # 2. Apply the 12-hour shift directly to the datetime object
+        # 2. Apply the shift (Now 0 hours, passing pure data)
         shifted_dt = utc_dt + timedelta(hours=HOURS_OFFSET)
         
-        # 3. Create a perfect string representation of the shifted time
+        # 3. Create a perfect string representation
         time_str = shifted_dt.strftime('%Y-%m-%d %H:%M:%S')
 
         # 4. Force all strings in the payload to match perfectly
@@ -83,7 +83,6 @@ class Send_EventRaw(RMQMessageSender):
         conn = sqlite3.connect(self.db_raw_path)
         cursor = conn.cursor()
 
-        # Shift the search window backwards so we catch the delayed records in the DB
         offset_seconds = HOURS_OFFSET * 3600
         search_start = str(int(start) - offset_seconds)
         search_end = str(int(end) - offset_seconds)
@@ -103,7 +102,6 @@ class Send_EventRaw(RMQMessageSender):
         print(f"[INFO] Found {len(rows)} records. Applying explicit {HOURS_OFFSET}h shift to payload...")
 
         for row in rows:
-            # We calculate the shifted epochs
             shifted_start_epoch = int(float(row[4])) + offset_seconds
             shifted_end_epoch = int(float(row[5])) + offset_seconds
 
@@ -116,7 +114,6 @@ class Send_EventRaw(RMQMessageSender):
                 'EventEndTime': shifted_end_epoch,
                 'CombineObjectTypeId': row[6]
             }
-            # Pass the ORIGINAL epoch to the sender so it can reliably calculate the string
             self.send_persistent_data(data, row[5]) 
 
         conn.close()
