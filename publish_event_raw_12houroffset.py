@@ -11,10 +11,10 @@ totalfoundrows = 0
 deviceinformation = ""
 fulldeviceinformation = ""
 
-# --- TIME OFFSET CONFIGURATION ---
-# 12 hours * 3600 seconds = 43200 seconds
-OFFSET_SECONDS = 43200 
-# ---------------------------------
+# --- CONFIGURATION ---
+# Use +12 to push data forward 12 hours. Use -12 to push it backwards.
+HOURS_OFFSET = 12 
+# ---------------------
 
 class Send_EventRaw(RMQMessageSender):
     """Send data via backhaul rewrite module."""
@@ -27,27 +27,25 @@ class Send_EventRaw(RMQMessageSender):
         self.message_sender = RMQMessageSender()
         self.message_sender.init(self.parameters)
 
-    def send_persistent_data(self, data, endtimestamp):
-        """Send single record to RMQ."""
-        # Convert integer or string timestamp to datetime
-        if isinstance(endtimestamp, (int, float)):
-            local_dt = datetime.fromtimestamp(endtimestamp)
-            utc_dt = datetime.fromtimestamp(endtimestamp, tz=timezone.utc)
-        else:
-            try:
-                local_dt = datetime.strptime(endtimestamp, "%Y-%m-%d %H:%M:%S")
-                utc_dt = local_dt.replace(tzinfo=timezone.utc)
-            except ValueError:
-                # If stored as UNIX timestamp string
-                local_dt = datetime.fromtimestamp(float(endtimestamp))
-                utc_dt = datetime.fromtimestamp(float(endtimestamp), tz=timezone.utc)
+    def send_persistent_data(self, data, original_epoch):
+        """Send single record to RMQ with absolute timezone bypass."""
+        
+        # 1. Convert the original epoch to an absolute UTC datetime object (ignoring Pi OS timezone)
+        utc_dt = datetime.fromtimestamp(float(original_epoch), tz=timezone.utc)
+        
+        # 2. Apply the 12-hour shift directly to the datetime object
+        shifted_dt = utc_dt + timedelta(hours=HOURS_OFFSET)
+        
+        # 3. Create a perfect string representation of the shifted time
+        time_str = shifted_dt.strftime('%Y-%m-%d %H:%M:%S')
 
+        # 4. Force all strings in the payload to match perfectly
         data.update({
             'CameraSerial': self.chip_serial,
-            'UploadedLocalDateTime': local_dt.strftime('%Y-%m-%d %H:%M:%S'),
-            'UploadedUTCDateTime': utc_dt.strftime('%Y-%m-%d %H:%M:%S'),
-            'EventStartLocalTime': local_dt.strftime('%Y-%m-%d %H:%M:%S'),
-            'EventStartUTCTime': utc_dt.strftime('%Y-%m-%d %H:%M:%S'),
+            'UploadedLocalDateTime': time_str,
+            'UploadedUTCDateTime': time_str,
+            'EventStartLocalTime': time_str,
+            'EventStartUTCTime': time_str,
         })
 
         body = {
@@ -59,43 +57,38 @@ class Send_EventRaw(RMQMessageSender):
         if deviceinformation[:3] == '15F':
             self.message_sender.send_message(
                 body=json.dumps(body),
-                prop=pika.BasicProperties(
-                    content_type="application/json"
-                ),
+                prop=pika.BasicProperties(content_type="application/json"),
                 exchange_name='data',
                 routing_key='backhaul.data'
             )
-            print(f"[INFO-15F] Sent corrected data for RoiId={data.get('RoiId')} MetricId={data.get('MetricId')}")
+            print(f"[INFO-15F] Sent data for {time_str}")
             
         elif deviceinformation[:3] in ('25F', '24J', '25X'):
             self.message_sender.send_message(
                 body=json.dumps(body),
-                prop=pika.BasicProperties(
-                    content_type="application/json"
-                ),
+                prop=pika.BasicProperties(content_type="application/json"),
                 exchange_name='data',
                 routing_key='persistent.backhaul.data'
             )
-            print(f"[INFO-25F] Sent corrected data for RoiId={data.get('RoiId')} MetricId={data.get('MetricId')}")
+            print(f"[INFO-25F] Sent data for {time_str}")
 
         time.sleep(0.01)
 
     def close_connection(self):
-        """Close RMQ connection."""
         self.message_sender.stop()
         print("[INFO] RabbitMQ connection closed.")
 
     def generate_data(self, start, end):
-        """Select and send records between given start and end timestamps."""
         self.db_raw_path = "/home/pi/Raspicam/eventRaw.db"
         conn = sqlite3.connect(self.db_raw_path)
         cursor = conn.cursor()
 
-        # Subtract 12 hours from the search query to find the delayed data in the DB
-        search_start = str(int(start) - OFFSET_SECONDS)
-        search_end = str(int(end) - OFFSET_SECONDS)
+        # Shift the search window backwards so we catch the delayed records in the DB
+        offset_seconds = HOURS_OFFSET * 3600
+        search_start = str(int(start) - offset_seconds)
+        search_end = str(int(end) - offset_seconds)
 
-        print(f"[INFO] Seeking records in DB between {search_start} and {search_end} (Adjusted -12h to catch delayed data)...")
+        print(f"[INFO] Seeking delayed DB records between {search_start} and {search_end}...")
 
         cursor.execute('''
             SELECT RegionID, MetricID, PeopleTypeID, PeopleID, EventStartTimeStamp, EventEndTimeStamp, CombineObjectTypeID
@@ -104,81 +97,56 @@ class Send_EventRaw(RMQMessageSender):
         ''', (search_start, search_end))
 
         rows = cursor.fetchall()
-
         global totalfoundrows
         totalfoundrows = len(rows)
         
-        print(f"[INFO] Found {len(rows)} records. Applying +12h correction to RabbitMQ payload...")
+        print(f"[INFO] Found {len(rows)} records. Applying explicit {HOURS_OFFSET}h shift to payload...")
 
         for row in rows:
-            # Correct the timestamps by adding 12 hours before sending
-            corrected_start = int(float(row[4])) + OFFSET_SECONDS
-            corrected_end = int(float(row[5])) + OFFSET_SECONDS
+            # We calculate the shifted epochs
+            shifted_start_epoch = int(float(row[4])) + offset_seconds
+            shifted_end_epoch = int(float(row[5])) + offset_seconds
 
             data = {
                 'RoiId': row[0],
                 'MetricId': row[1],
                 'PeopleTypeId': row[2],
                 'PeopleId': row[3],
-                'EventStartTime': corrected_start,
-                'EventEndTime': corrected_end,
+                'EventStartTime': shifted_start_epoch,
+                'EventEndTime': shifted_end_epoch,
                 'CombineObjectTypeId': row[6]
             }
-            print(f"[DEBUG] Sending data: {data}")
-            self.send_persistent_data(data, corrected_end) 
-            time.sleep(0.01)  # optional delay between messages
+            # Pass the ORIGINAL epoch to the sender so it can reliably calculate the string
+            self.send_persistent_data(data, row[5]) 
 
         conn.close()
-        print("[INFO] Database connection closed.")
-
 
     def get_device_data(self):
         self.db_raw_path = "/home/pi/Raspicam/raspicam"
         conn = sqlite3.connect(self.db_raw_path)
         cursor = conn.cursor()
-
         global deviceinformation, fulldeviceinformation
         
-        cursor.execute('''
-            SELECT * FROM camera;
-        ''')
-
-        rows = cursor.fetchall()
-        
-        for row in rows:
+        cursor.execute('SELECT * FROM camera;')
+        for row in cursor.fetchall():
             fulldeviceinformation = row
             
-        cursor.execute('''
-            SELECT companyserial FROM camera;
-        ''')
-
-        rows = cursor.fetchall()
-        
-        for row in rows:
+        cursor.execute('SELECT companyserial FROM camera;')
+        for row in cursor.fetchall():
             deviceinformation = row[0]
 
         conn.close()
-        print("[INFO] Database connection closed.")
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python3 send_eventraw.py <start_time> <end_time>")
-        print("Example: python3 test.py 1761868800 1762127999")
         sys.exit(1)
 
     start_time = sys.argv[1]
     end_time = sys.argv[2]
 
     sender = Send_EventRaw()
-    
     sender.get_device_data()
-    
-    print(f'[INFO] Device Info: {deviceinformation}')
-    
-    if deviceinformation[:3] == '15F':
-        print('[INFO] 15F Device Detected')
-    elif deviceinformation[:3] in ('25F', '24J', '25X'):
-        print('[INFO] 25F Device Detected')
     
     try:
         sender.generate_data(start_time, end_time)
@@ -190,9 +158,7 @@ if __name__ == "__main__":
         with open('/proc/device-tree/serial-number', 'r') as f:
             dev_serial = f.read().strip('\x00').strip()
     except Exception as e:
-        dev_serial = f"Error reading serial: {e}"
+        pass
 
     print(f'[INFO] Total rows of records found: {totalfoundrows}')
-    print(f'[INFO] Device Info: {fulldeviceinformation}')
     print(f'[INFO] Device Company Serial: {deviceinformation}')
-    print(f'[INFO] Device Serial: {dev_serial}')
